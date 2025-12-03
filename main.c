@@ -61,7 +61,7 @@ void System_init()
 	RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;// enable timer 2 clock
 
 	// GPIOB and and GPIOC clocks (leds and buttons)
-	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN;
+	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN;
 
 }
 
@@ -106,19 +106,18 @@ void Timer2_config()
 	TIM2->ARR = 1 << 12; // auto-reload
 	TIM2->DIER |= TIM_DIER_UIE; // enable interrupt
 	TIM2->CR1 |= TIM_CR1_URS; // counter overflow as only event source
-
-	TIM2->CR2 |= TIM_CR1_CEN;
+	TIM2->CR1 |= TIM_CR1_CEN;
 	NVIC_EnableIRQ(TIM2_IRQn); // enable interrupt request
 }
 
 // IRQHandler
-void Timer2_IRQHandler()
+void TIM2_IRQHandler(void)
 {
 	if(TIM2->SR & TIM_SR_UIF)
 	{
 		TIM2->SR &= ~TIM_SR_UIF;  // clear update interrupt flag
 
-		static unit32_t tick = 0; // short scheduler action only
+		static uint32_t tick = 0; // short scheduler action only
 		tick++;
 
 		// set flags for main loop to run model
