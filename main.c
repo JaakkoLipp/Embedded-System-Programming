@@ -9,6 +9,10 @@
 #define MODE_MODULATE 2U
 #endif
 
+extern uint32_t SystemCoreClock; // system clock frequency 
+// convert baud into BRR value
+#define baud(bps) \ (((SystemCoreClock/((bps)*16)) << 4) | ((SystemCoreClock/(bps)) % 16))
+
 // Mode flag supplied by UI logic; determines whether control is active.
 extern volatile uint8_t mode;
 
@@ -189,6 +193,8 @@ static void controller_subsystem_init(void)
 }
 
 void uart_init(){
+	// enable USART2 clock
+	RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
 	// set PA2 & PA3 alternate functions to AF7 (USART2 RX/TX)
 	bits_val(GPIOA->AFR[0], 4, 2, 7); // PA2 -> USART2_TX
 	bits_val(GPIOA->AFR[0], 4, 3, 7); // PA3 -> USART2_RX
