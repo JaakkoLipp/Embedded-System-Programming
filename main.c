@@ -124,6 +124,29 @@ static volatile uint16_t uart_tx_head = 0, uart_tx_tail = 0;
 
 static inline uint16_t rb_next(uint16_t v, uint16_t sz) { return (uint16_t)((v + 1U) % sz); }
 
+static uint32_t rcc_get_hclk(void)
+{
+    static const uint16_t ahb_div[16] = {1,1,1,1,1,1,1,1,2,4,8,16,64,128,256,512};
+    uint32_t hpre = (RCC->CFGR >> 4) & 0xFU;
+    return SystemCoreClock / ahb_div[hpre];
+}
+
+static uint32_t rcc_get_pclk1(void)
+{
+    static const uint8_t apb_div[8] = {1,1,1,1,2,4,8,16};
+    uint32_t ppre1 = (RCC->CFGR >> 10) & 0x7U;
+    return rcc_get_hclk() / apb_div[ppre1];
+}
+
+static uint16_t usart_brr_oversample16(uint32_t pclk, uint32_t baud)
+{
+    uint32_t div = (pclk + (baud / 2U)) / baud;
+    uint32_t mant = div / 16U;
+    uint32_t frac = div % 16U;
+    if (frac > 15U) { mant++; frac = 0U; }
+    return (uint16_t)((mant << 4) | (frac & 0xFU));
+}
+
 static void uart_init(void)
 {
     // Enable USART2 clock
@@ -135,7 +158,8 @@ static void uart_init(void)
     bits_val(GPIOA->MODER , 2, 2, 2);
     bits_val(GPIOA->MODER , 2, 3, 2);
 
-    USART2->BRR = baud(115200);
+    USART2->CR1 &= ~USART_CR1_OVER8;
+    USART2->BRR = usart_brr_oversample16(rcc_get_pclk1(), 115200U);
     USART2->CR1 = 0;
     USART2->CR1 |= USART_CR1_UE | USART_CR1_RE | USART_CR1_TE;
     USART2->CR1 |= USART_CR1_RXNEIE; // RX interrupt
