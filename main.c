@@ -11,6 +11,10 @@
 #define MODE_IDLE      1U
 #define MODE_MODULATE  2U
 
+#define baud(bps) \
+	(((SystemCoreClock/((bps)*16)) << 4) | ((SystemCoreClock/(bps)) % 16))
+
+
 // Weak default; if another module defines mode, it overrides this.
 __attribute__((weak)) volatile uint8_t mode = MODE_MODULATE;
 
@@ -19,6 +23,18 @@ __attribute__((weak)) volatile uint8_t mode = MODE_MODULATE;
 #define CONTROLLER_DIV      10U             // controller every 10 ms
 #define CONTROL_HZ          (TICK_HZ / CONTROLLER_DIV)
 static const float TS_CONTROL = (1.0f / (float)CONTROL_HZ);
+
+#define MODEL_HZ            50000U          // converter model sampling rate per spec
+#if (MODEL_HZ % TICK_HZ) != 0
+#error "MODEL_HZ must be an integer multiple of TICK_HZ"
+#endif
+#define MODEL_STEPS_PER_TICK (MODEL_HZ / TICK_HZ)
+
+#define PWM_HZ              100000U           // LED brightness carrier frequency
+
+#define CONTROLLER_U_MIN     0.0f
+#define CONTROLLER_U_MAX     3.0f
+#define DEFAULT_REF_UOUT     1.5f
 
 static volatile uint32_t g_ms = 0;          // millisecond timebase (from TIM2 IRQ)
 
@@ -54,14 +70,16 @@ void pi_set_kp(float kp);
 void pi_set_ki(float ki);
 
 static void pwm_init(void);
-static void pwm_set_duty(float duty);
+static void pwm_set_duty(PIController *pi, float duty);
 static void controller_subsystem_init(void);
 
 // Global controller state
 static PIController g_pi;
 volatile float controller_out = 0.0f;
-volatile float reference_uout = 5.0f;
+volatile float reference_uout = DEFAULT_REF_UOUT;
 static uint32_t pwm_period = 0; // ARR+1 snapshot
+volatile float g_uout = 0.0f;
+volatile float g_pwm_duty = 0.0f;
 
 // ---------------------- Converter model ----------------------
 // state vector x = [i1, u1, i2, u2, i3, u3]^T
@@ -69,7 +87,7 @@ static float x_state[6] = {0};
 
 static const float A[6][6] = {
     {0.9652, -0.0172,  0.0057, -0.0058,  0.0052, -0.0251},
-    {0.7732,  0.1252,  0.2315, -0.0700,  0.1282,  0.7754},
+    {0.7732,  0.1252,  0.2315, 0.0700,  0.1282,  0.7754},
     {0.8278, -0.7522, -0.0956,  0.3299, -0.4855,  0.3915},
     {0.9948,  0.2655, -0.3848,  0.4212,  0.3927,  0.2899},
     {0.7648, -0.4165, -0.4855, -0.3366, -0.0986,  0.7281},
@@ -285,61 +303,99 @@ static float pi_step(PIController *pi, float reference, float measurement)
 void pi_set_kp(float kp) { g_pi.kp = kp; }
 void pi_set_ki(float ki) { g_pi.ki = ki; }
 
-// ---------------------- PWM on PA5 / TIM2_CH1 ----------------------
+// ---------------------- PWM on PB5 / TIM3_CH2 ----------------------
 static void pwm_init(void)
 {
-    // configure PA5 as TIM2_CH1
-    GPIOA->MODER &= ~(3U << (5U * 2U));
-    GPIOA->MODER |=  (2U << (5U * 2U));
-    GPIOA->AFR[0] &= ~(0xFU << (5U * 4U));
-    GPIOA->AFR[0] |=  (1U << (5U * 4U));   // AF1 TIM2
-    GPIOA->OTYPER &= ~(1U << 5);
-    GPIOA->OSPEEDR |= (3U << (5U * 2U));
-    GPIOA->PUPDR &= ~(3U << (5U * 2U));
+    // configure PB5 as TIM3_CH2 (RGB LED brightness channel)
+    GPIOB->MODER &= ~(3U << (5U * 2U));
+    GPIOB->MODER |=  (2U << (5U * 2U));
+    GPIOB->AFR[0] &= ~(0xFU << (5U * 4U));
+    GPIOB->AFR[0] |=  (2U << (5U * 4U));   // AF2 TIM3
+    GPIOB->OTYPER &= ~(1U << 5);
+    GPIOB->OSPEEDR |= (3U << (5U * 2U));
+    GPIOB->PUPDR &= ~(3U << (5U * 2U));
 
-    // PWM mode 1 on CH1
-    TIM2->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_OC1M);
-    TIM2->CCMR1 |=  (TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_2);
-    TIM2->CCMR1 |=  TIM_CCMR1_OC1PE;
+    uint32_t tim_clk = SystemCoreClock;
+    uint32_t ppre1 = (RCC->CFGR >> 10) & 0x7U;
+    if (ppre1 >= 4U) tim_clk *= 2U; // TIMx clock doubles when APB prescaler != 1
 
-    TIM2->CCER &= ~TIM_CCER_CC1P;
-    TIM2->CCER |=  TIM_CCER_CC1E;
+    const uint32_t target_cnt = 1000000U; // 1 MHz carrier clock
+    uint32_t psc = tim_clk / target_cnt;
+    if (psc == 0U) psc = 1U;
+    psc -= 1U;
 
-    TIM2->CR1 |= TIM_CR1_ARPE;
+    TIM3->CR1 &= ~TIM_CR1_CEN;
+    TIM3->PSC = psc;
+    TIM3->ARR = (target_cnt / PWM_HZ) - 1U;
+    TIM3->CNT = 0U;
 
-    pwm_period = (TIM2->ARR + 1U);
-    TIM2->CCR1 = 0;
+    // PWM mode 1 on CH2
+    TIM3->CCMR1 &= ~(TIM_CCMR1_CC2S | TIM_CCMR1_OC2M);
+    TIM3->CCMR1 |=  (TIM_CCMR1_OC2M_1 | TIM_CCMR1_OC2M_2);
+    TIM3->CCMR1 |=  TIM_CCMR1_OC2PE;
+
+    TIM3->CCER &= ~TIM_CCER_CC2P;
+    TIM3->CCER |=  TIM_CCER_CC2E;
+
+    TIM3->CR1 |= TIM_CR1_ARPE;
+    TIM3->EGR |= TIM_EGR_UG;
+
+    pwm_period = (TIM3->ARR + 1U);
+    TIM3->CCR2 = 0;
+    TIM3->CR1 |= TIM_CR1_CEN;
 }
 
-static void pwm_set_duty(float duty)
+static void pwm_set_duty(PIController *pi, float control_signal)
 {
-    float d = clampf(duty, 0.0f, 1.0f);
+    if (!pi) return;
 
-    uint32_t period = (TIM2->ARR + 1U);
+    float limited = clampf(control_signal, pi->u_min, pi->u_max);
+    float span = pi->u_max - pi->u_min;
+    float duty = (span > 0.0f) ? ((limited - pi->u_min) / span) : 0.0f;
+    duty = clampf(duty, 0.0f, 1.0f);
+
+    uint32_t period = (TIM3->ARR + 1U);
     if (period != pwm_period) pwm_period = period;
 
-    if (pwm_period == 0U) { TIM2->CCR1 = 0; return; }
+    if (pwm_period == 0U)
+    {
+        TIM3->CCR2 = 0;
+        g_pwm_duty = duty;
+        return;
+    }
 
-    if (d <= 0.0f) { TIM2->CCR1 = 0; return; }
-    if (d >= 1.0f) { TIM2->CCR1 = pwm_period; return; } // CCR>ARR => always high
+    if (duty <= 0.0f)
+    {
+        TIM3->CCR2 = 0;
+        g_pwm_duty = 0.0f;
+        return;
+    }
+    if (duty >= 1.0f)
+    {
+        TIM3->CCR2 = pwm_period;
+        g_pwm_duty = 1.0f;
+        return; // CCR>ARR => always high
+    }
 
-    uint32_t ccr = (uint32_t)(d * (float)pwm_period + 0.5f);
+    uint32_t ccr = (uint32_t)(duty * (float)pwm_period + 0.5f);
     if (ccr > pwm_period) ccr = pwm_period;
-    TIM2->CCR1 = ccr;
+    TIM3->CCR2 = ccr;
+    g_pwm_duty = duty;
 }
 
 static void controller_subsystem_init(void)
 {
     pwm_init();
-    pi_init(&g_pi, 0.1f, 50.0f, TS_CONTROL, 0.0f, 1.0f);
+    pi_init(&g_pi, 0.1f, 0.1f, TS_CONTROL, CONTROLLER_U_MIN, CONTROLLER_U_MAX);
     controller_out = 0.0f;
-    pwm_set_duty(0.0f);
+    reference_uout = clampf(reference_uout, g_pi.u_min, g_pi.u_max);
+    pwm_set_duty(&g_pi, 0.0f);
 }
 
 // ---------------------- GPIO / LEDs ----------------------
 void System_init(void)
 {
-    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN | RCC_APB1ENR_TIM3EN;
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN;
 }
 
@@ -361,41 +417,35 @@ void Gpio_init(void)
     GPIOC->PUPDR |= (1U << (6U * 2U));
     GPIOC->PUPDR |= (1U << (5U * 2U));
 
-    // leds PB10, PB4, PB5 output
+    // leds PB10, PB4 output (PB5 configured for PWM in pwm_init)
     GPIOB->MODER &= ~(3U << (10U * 2U));
-    GPIOB->MODER &= ~(3U << (5U * 2U));
     GPIOB->MODER &= ~(3U << (4U * 2U));
 
     GPIOB->MODER |= (1U << (10U * 2U));
-    GPIOB->MODER |= (1U << (5U * 2U));
     GPIOB->MODER |= (1U << (4U * 2U));
 }
 
 static inline void led_pb10_set(int on) { if (on) GPIOB->ODR |= (1U<<10); else GPIOB->ODR &= ~(1U<<10); }
 static inline void led_pb4_set (int on) { if (on) GPIOB->ODR |= (1U<<4 ); else GPIOB->ODR &= ~(1U<<4 ); }
-static inline void led_pb5_set (int on) { if (on) GPIOB->ODR |= (1U<<5 ); else GPIOB->ODR &= ~(1U<<5 ); }
 
 // Mode indication:
 // - CONFIG: blink PB10 fast (2 Hz)
 // - IDLE:   blink PB4 slow (1 Hz)
-// - MOD:    PB10/PB4 off, PWM on PA5 shows duty (brightness)
+// - MOD:    PB10/PB4 off, PB5 PWM brightness tracks controller duty
 static void ui_update_leds(void)
 {
     if (mode == MODE_CONFIG) {
         led_pb4_set(0);
-        led_pb5_set(0);
         // 2 Hz blink -> 250 ms on / 250 ms off
         led_pb10_set(((g_ms / 250U) % 2U) ? 1 : 0);
     } else if (mode == MODE_IDLE) {
         led_pb10_set(0);
-        led_pb5_set(0);
         // 1 Hz blink -> 500 ms on / 500 ms off
         led_pb4_set(((g_ms / 500U) % 2U) ? 1 : 0);
     } else { // MODE_MODULATE
         led_pb10_set(0);
         led_pb4_set(0);
-        led_pb5_set(0);
-        // PA5 PWM already reflects controller_out
+        // PWM hardware on PB5 (TIM3_CH2) already reflects controller_out
     }
 }
 
@@ -450,7 +500,7 @@ static void print_status(void)
     const char *m = (mode==MODE_CONFIG) ? "config" : (mode==MODE_IDLE) ? "idle" : "mod";
     int n = snprintf(buf, sizeof(buf),
         "mode=%s sem_uart=%u ref=%.3f kp=%.3f ki=%.3f uout=%.3f duty=%.3f\r\n",
-        m, (unsigned)ui_sem_uart, reference_uout, g_pi.kp, g_pi.ki, uout, controller_out);
+        m, (unsigned)ui_sem_uart, reference_uout, g_pi.kp, g_pi.ki, uout, g_pwm_duty);
     if (n > 0) uart_write_str(buf);
 }
 
@@ -464,6 +514,10 @@ static void print_help(void)
         "  kp <float>      (config mode)\r\n"
         "  ki <float>      (config mode)\r\n"
         "  ref <float>     (mod mode)\r\n");
+
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "    ref range: %.1f..%.1f\r\n", g_pi.u_min, g_pi.u_max);
+    if (n > 0) uart_write_str(buf);
 }
 
 static uint8_t parse_mode_token(const char *t, uint8_t *out_mode)
@@ -543,8 +597,10 @@ static void handle_command(char *line)
         if (mode != MODE_MODULATE) { uart_write_str("ERR: ref only in modulating\r\n"); return; }
         if (!arg) { uart_write_str("ERR: ref <float>\r\n"); return; }
         float v = strtof(arg, NULL);
-        reference_uout = v;
+        float clamped = clampf(v, g_pi.u_min, g_pi.u_max);
+        reference_uout = clamped;
         uart_write_str("OK\r\n");
+        if (clamped != v) uart_write_str("WARN: ref limited to controller range\r\n");
         print_status();
         return;
     }
@@ -609,6 +665,7 @@ static void handle_buttons(void)
         else if (mode == MODE_MODULATE)
         {
             reference_uout += inc * 0.5f;
+            reference_uout = clampf(reference_uout, g_pi.u_min, g_pi.u_max);
             uart_write_str("BTN ref change\r\n");
             print_status();
         }
@@ -678,24 +735,29 @@ int main(void)
         {
             flag_MODEL = 0;
             float u_in = (mode == MODE_MODULATE) ? controller_out : 0.0f;
-            model_update(u_in);
+            u_in = clampf(u_in, g_pi.u_min, g_pi.u_max);
+            for (uint32_t i = 0; i < MODEL_STEPS_PER_TICK; ++i)
+            {
+                model_update(u_in);
+            }
         }
 
         // Controller update (every 10 ms)
         if (flag_CONTROLLER)
         {
             flag_CONTROLLER = 0;
-            float meas = model_output_u3();
 
+            float meas = model_output_u3();
+            g_uout = meas;
             if (mode == MODE_MODULATE)
             {
                 controller_out = pi_step(&g_pi, reference_uout, meas);
-                pwm_set_duty(controller_out);
+                pwm_set_duty(&g_pi, controller_out);
             }
             else
             {
                 controller_out = 0.0f;
-                pwm_set_duty(0.0f);
+                pwm_set_duty(&g_pi, 0.0f);
             }
         }
 
